@@ -17,9 +17,11 @@ import subprocess
 import sys
 import time
 import yaml
+import re
 from pathlib import Path
 
 from google import genai
+from google.genai import errors as genai_errors
 import requests
 import tiktoken
 
@@ -215,6 +217,20 @@ def get_integration_files_for_prompt(integration_path: Path) -> str:
         integration_files.append(f"\n--- END FILE ---")
 
     return "".join(integration_files).strip()
+
+
+def _friendly_retry_hint(message: str) -> str:
+    """
+    Extract a human friendly retry hint from a Gemini error message.
+    """
+    match = re.search(r"retry in ([\d\.]+)s", message)
+    if not match:
+        return ""
+    seconds = float(match.group(1))
+    if seconds >= 60:
+        minutes = round(seconds / 60)
+        return f"Retry after ~{minutes}m."
+    return f"Retry after ~{round(seconds)}s."
 
 
 def estimate_tokens(prompt: str, model: str = "gpt-4") -> int:
@@ -427,16 +443,35 @@ def main(token: str, args) -> None:
         print(f"Generating report {current}/{total} for {rule}...")
         start_time = time.time()
         report = "bla"
-        response = client.models.generate_content(
-            model=model,
-            contents=RULE_REVIEW_PROMPT.format(
-                integration=args.integration,
-                rule=rule,
-                rule_url=QUALITY_SCALE_RULE_DOCS_URL.format(rule),
-                rule_content=requests.get(QUALITY_SCALE_RULE_RAW_URL.format(rule)).text,
-                files=integration_files,
-            ),
-        )
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=RULE_REVIEW_PROMPT.format(
+                    integration=args.integration,
+                    rule=rule,
+                    rule_url=QUALITY_SCALE_RULE_DOCS_URL.format(rule),
+                    rule_content=requests.get(
+                        QUALITY_SCALE_RULE_RAW_URL.format(rule)
+                    ).text,
+                    files=integration_files,
+                ),
+            )
+        except genai_errors.ClientError as exc:
+            error_text = str(exc)
+            if getattr(exc, "status_code", None) == 429 or "RESOURCE_EXHAUSTED" in error_text:
+                retry_hint = _friendly_retry_hint(error_text)
+                print(
+                    f"Gemini quota exceeded for model {model} while generating {rule}."
+                )
+                if retry_hint:
+                    print(retry_hint)
+                print(
+                    "Wait for quota to reset or rerun without --free-model to use paid quota."
+                )
+                sys.exit(1)
+
+            print(f"Gemini API error while generating {rule}: {error_text}")
+            sys.exit(1)
 
         report = response.text
 
